@@ -48,5 +48,6 @@ jobs:
             echo "Nada que guardar"
           else
             git commit -m "Radares $(date -u +%F)"
+            git pull --rebase -X theirs origin main || git pull --rebase origin main
             git push
           fi

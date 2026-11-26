@@ -671,6 +671,9 @@ def main():
     total, hechos, consulta = len(pendientes), 0, 0
     lote_n = 25
     while pendientes:
+        if not queda_tiempo():
+            print(f"  Tiempo agotado: {len(pendientes)} radares quedan para la próxima actualización.", flush=True)
+            break
         lote = []
         while pendientes and len(lote) < lote_n:
             r = pendientes.pop(0)
@@ -700,9 +703,6 @@ def main():
         guardar_cobertura(cobertura, "trazado", lote)
         consulta += 1
         print(f"  {hechos}/{total} radares revisados ({consulta} consultas)", flush=True)
-        if not queda_tiempo():
-            print(f"  Tiempo agotado: {len(pendientes)} radares quedan para la próxima actualización.", flush=True)
-            break
 
     # 6. Sentido vigilado, límite y caminos de aproximación
     metodos = Counter()

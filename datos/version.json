@@ -1,0 +1,12 @@
+{
+ "formato": 1,
+ "generado": "2026-11-26T14:19:29Z",
+ "dgt_publicado": "2025-12-18T09:56:52.406+01:00",
+ "radares": 2679,
+ "con_aproximacion": 1865,
+ "archivo": "radares.json.gz",
+ "bytes": 131224,
+ "sha256": "593a441b424c729a3c77c326d9581feb4c023d6e192834c1ed998484a8ff573c",
+ "contenido": "9bb70f2df04efe6fd9346b68394eaa7460a8af4a27200cb56c2d9a5936dd9d50",
+ "comprobado": "2026-11-26T14:19:35Z"
+}
