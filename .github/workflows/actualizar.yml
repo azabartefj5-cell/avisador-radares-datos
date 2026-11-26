@@ -1,0 +1,52 @@
+# Actualiza la base de radares dos veces por semana y la publica en datos/.
+# Los móviles consultan datos/version.json una vez al día y bajan la base si ha cambiado.
+#
+# - Si Overpass (OpenStreetMap) falla, el script sigue con lo que ya hay en la caché y
+#   lo que falte se completa en la siguiente ejecución.
+# - Si la base nueva parece rota, publicar.py la rechaza y los móviles siguen con la anterior.
+# - Si algo falla, GitHub avisa por correo al dueño del repositorio.
+# - Cada ejecución hace un commit (al menos la fecha de comprobación), así GitHub no
+#   desactiva la tarea programada por inactividad (lo hace a los 60 días sin actividad).
+name: Actualizar radares
+
+on:
+  schedule:
+    - cron: "17 3 * * 1,4"   # lunes y jueves a las 03:17 UTC
+  workflow_dispatch:          # botón "Run workflow" para lanzarla a mano
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-radares
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Generar la base
+        run: python -I herramientas/generar_radares.py --actualizar --minutos 270 --salida build/radares.json
+
+      - name: Comprobar y publicar
+        run: python -I herramientas/publicar.py --entrada build/radares.json --destino datos
+
+      - name: Guardar en el repositorio
+        if: always()   # aunque falle la publicación, se guarda lo descargado en la caché
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A herramientas/cache datos
+          if git diff --cached --quiet; then
+            echo "Nada que guardar"
+          else
+            git commit -m "Radares $(date -u +%F)"
+            git push
+          fi
