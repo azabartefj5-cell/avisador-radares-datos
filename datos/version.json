@@ -1,12 +1,13 @@
 {
  "formato": 1,
- "generado": "2026-11-26T16:54:57Z",
+ "generado": "2026-11-28T11:55:57Z",
  "dgt_publicado": "2025-12-18T09:56:52.406+01:00",
- "radares": 2638,
- "con_aproximacion": 1891,
+ "radares": 2553,
+ "con_aproximacion": 2510,
+ "oficiales": 981,
  "archivo": "radares.json.gz",
- "bytes": 134998,
- "sha256": "fd26e5f514e40950f3716f541596160ef9e7382daa742a658c1fba45a344faee",
- "contenido": "619db3789210a89b298cc05f7818c3d333c83151b02648d09b76775604e43c9c",
- "comprobado": "2026-11-26T16:54:57Z"
+ "bytes": 400710,
+ "sha256": "fc0e623e48c2a804eaacc0995bc288242a8760216c4994ba476c067f7befabbb",
+ "contenido": "1879af9a2633e8a67a3444b9122452ef030ac5568053c057c92a5c09c903b099",
+ "comprobado": "2026-11-28T11:55:59Z"
 }
