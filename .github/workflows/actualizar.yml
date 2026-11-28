@@ -1,8 +1,8 @@
 # Actualiza la base de radares dos veces por semana y la publica en datos/.
 # Los móviles consultan datos/version.json una vez al día y bajan la base si ha cambiado.
 #
-# - Si Overpass (OpenStreetMap) falla, el script sigue con lo que ya hay en la caché y
-#   lo que falte se completa en la siguiente ejecución.
+# - Listas oficiales: DGT y Servei Català de Trànsit (si no responden, se usa la última copia).
+# - Mapa: el fichero de OpenStreetMap de España de Geofabrik (se renueva cada día).
 # - Si la base nueva parece rota, publicar.py la rechaza y los móviles siguen con la anterior.
 # - Si algo falla, GitHub avisa por correo al dueño del repositorio.
 # - Cada ejecución hace un commit (al menos la fecha de comprobación), así GitHub no
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -32,14 +32,28 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Instalar herramientas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          pip install --quiet "osmium>=4.0"
+
+      - name: Descargar el mapa de España (OpenStreetMap, Geofabrik)
+        run: |
+          mkdir -p build
+          curl -fsSL --retry 5 --retry-delay 60 -o build/spain.osm.pbf https://download.geofabrik.de/europe/spain-latest.osm.pbf
+          # Solo carreteras, radares e hitos: el fichero baja de ~1,5 GB a unos cientos de MB.
+          osmium tags-filter build/spain.osm.pbf w/highway n/highway=speed_camera,milestone -o build/carreteras.osm.pbf --overwrite
+          ls -lh build
+
       - name: Generar la base
-        run: python -I herramientas/generar_radares.py --actualizar --minutos 270 --salida build/radares.json
+        run: python -I herramientas/generar_radares.py --pbf build/carreteras.osm.pbf --salida build/radares.json
 
       - name: Comprobar y publicar
         run: python -I herramientas/publicar.py --entrada build/radares.json --destino datos
 
       - name: Guardar en el repositorio
-        if: always()   # aunque falle la publicación, se guarda lo descargado en la caché
+        if: always()   # aunque falle la publicación, se guardan las copias de las listas oficiales
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

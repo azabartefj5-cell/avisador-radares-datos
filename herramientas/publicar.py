@@ -66,9 +66,9 @@ def problemas(base, anterior):
         n0, n1 = anterior["radares"], len(radares)
         if n1 < n0 * (1 - CAIDA_MAXIMA_RADARES):
             fallos.append(f"de {n0} a {n1} radares de golpe")
-        a0, a1 = anterior.get("con_aproximacion", 0), sum(1 for r in radares if r.get("ap"))
+        a0, a1 = anterior.get("con_aproximacion", 0), sum(1 for r in radares if r.get("ap") or r.get("ap2"))
         if a1 < a0 * (1 - CAIDA_MAXIMA_APROXIMACION):
-            fallos.append(f"de {a0} a {a1} radares con camino de aproximación (¿se perdió la caché de carreteras?)")
+            fallos.append(f"de {a0} a {a1} radares con camino de aproximación (¿falló la lectura del mapa?)")
     return fallos
 
 
@@ -115,7 +115,8 @@ def main():
             "generado": base["generado"],
             "dgt_publicado": base.get("dgt_publicado"),
             "radares": len(base["radares"]),
-            "con_aproximacion": sum(1 for r in base["radares"] if r.get("ap")),
+            "con_aproximacion": sum(1 for r in base["radares"] if r.get("ap") or r.get("ap2")),
+            "oficiales": sum(1 for r in base["radares"] if r.get("o")),
             "archivo": "radares.json.gz",
             "bytes": len(datos_gz),
             "sha256": hashlib.sha256(datos_gz).hexdigest(),

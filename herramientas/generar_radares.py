@@ -1,36 +1,46 @@
 #!/usr/bin/env python3
 """
-Genera radares.json, la base de datos que usa el avisador (por defecto en build/).
+Genera radares.json, la base de datos que usa el avisador.
 
 Fuentes:
   * DGT (Punto de Acceso Nacional, DATEX II): cabinas de radar fijo y radares de tramo.
-    No incluye Cataluña, País Vasco ni radares municipales.
-  * OpenStreetMap (highway=speed_camera): completa esos huecos.
-  * OpenStreetMap (carreteras e hitos kilométricos): sirve para saber
-      - en qué sentido vigila cada radar (rumbo), y
-      - por qué tramo de carretera se llega a él ("aproximación").
-    Con la aproximación, el móvil solo avisa si vas por esa carretera y en ese sentido.
+    No incluye Cataluña, País Vasco ni radares municipales.                   -> OFICIAL
+  * Servei Català de Trànsit (transit.gencat.cat): radares fijos de Cataluña.  -> OFICIAL
+  * OpenStreetMap (highway=speed_camera): completa los huecos. Son datos de voluntarios:
+    la app los anuncia como «posible radar» salvo que coincidan con un radar oficial.
+    Se descartan los que el propio mapa marca como móviles, temporales, pedagógicos,
+    de semáforo en rojo, de cinturón o retirados.
+  * OpenStreetMap (carreteras e hitos kilométricos, del fichero de Geofabrik): sirven para
+      - saber en qué sentido vigila cada radar, y
+      - por qué tramos de carretera se llega a él ("aproximaciones").
+    Con las aproximaciones el móvil solo avisa si vas por esa carretera y en ese sentido.
+
+Sentido vigilado, de más a menos fiable:
+  1. tramo DGT (del inicio al final) o PK oficial DGT + hitos kilométricos;
+  2. etiqueta direction de OSM o radar sobre una calzada de sentido único;
+  3. calzada de sentido único junto al radar (autovías y avenidas con mediana);
+  4. lado de la calzada donde está dibujado el poste (en España, a la derecha del
+     tráfico que vigila): acierta ~83 %, así que el sentido contrario se guarda como
+     «dudoso» (la app avisa de él como posible radar);
+  5. sin pistas: los dos sentidos, ambos dudosos.
 
 Uso:
-    python herramientas/generar_radares.py            # usa la caché si existe
-    python herramientas/generar_radares.py --refrescar # vuelve a descargarlo todo
-    python herramientas/generar_radares.py --actualizar --minutos 300
-        # actualización periódica (la usa GitHub Actions): renueva la lista de radares,
-        # reutiliza las carreteras ya descargadas y no aborta si Overpass falla
+    python herramientas/generar_radares.py --pbf spain-latest.osm.pbf
+    python herramientas/generar_radares.py --pbf madrid-latest.osm.pbf --zona 40.3,-3.9,40.6,-3.2   # pruebas
 
-Licencias: datos DGT reutilizables citando la fuente; datos OSM © colaboradores de
-OpenStreetMap bajo ODbL (la base derivada debe compartirse con la misma licencia).
+El fichero .osm.pbf se descarga de https://download.geofabrik.de/europe/spain-latest.osm.pbf
+
+Licencias: datos DGT y Generalitat reutilizables citando la fuente; datos OSM © colaboradores
+de OpenStreetMap bajo ODbL (la base derivada debe compartirse con la misma licencia).
 """
 import argparse
-import glob
-import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
-import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
@@ -40,18 +50,17 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(RAIZ, "herramientas", "cache")
 SALIDA = os.path.join(RAIZ, "build", "radares.json")  # la app la incluye copiándola a app/src/main/assets
 URL_DGT = "https://nap.dgt.es/datex2/dgt/PredefinedLocationsPublication/radares/content.xml"
-SERVIDORES_OVERPASS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-]
-AGENTE = "avisador-radares-prototipo/0.1"
+URL_SCT = "https://transit.gencat.cat/web/.content/documents/seguretat_viaria/radars.txt"
+AGENTE = "avisador-radares/0.3"
 VIAS = "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street)(_link)?$"
 
 LONG_APROXIMACION = 1300   # metros de carretera guardados antes de cada radar
-RADIO_CARRETERA = 1400     # radio de búsqueda de la carretera alrededor del radar
+RADIO_RED = 1700           # carreteras que se cargan alrededor de cada radar
 MAX_DIST_RADAR_VIA = 45    # distancia máxima radar-carretera para considerarlo "en" esa vía
-MAX_RAMAS = 6              # caminos de aproximación por radar (bifurcaciones)
+MAX_DIST_OFICIAL = 80      # las coordenadas oficiales a veces están algo apartadas de la vía
+MIN_APROXIMACION = 30      # una aproximación corta (radar justo después de una rotonda) también sirve
+MIN_RAMA = 50              # ramas laterales más cortas (salidas de garajes...) no se guardan
+MAX_RAMAS = 6              # caminos de aproximación por sentido (carretera principal + accesos)
 RADIO_HITOS = 20000        # hasta dónde buscar puntos kilométricos conocidos de la misma carretera
 R_TIERRA = 6371008.8
 NS = "{http://datex2.eu/schema/1_0/1_0}"
@@ -142,51 +151,10 @@ def codificar_polilinea(puntos):
 # ----------------------------------------------------------------------------- descargas
 
 
-def descargar(url, datos=None, timeout=300):
+def descargar(url, datos=None, timeout=120):
     peticion = urllib.request.Request(url, data=datos, headers={"User-Agent": AGENTE})
     with urllib.request.urlopen(peticion, timeout=timeout) as r:
         return r.read()
-
-
-def overpass(consulta, etiqueta, refrescar=False, tolerante=False, intentos=12):
-    """Consulta Overpass con caché en disco y reintentos en varios servidores.
-
-    Con tolerante=True, si ningún servidor responde devuelve la copia de la caché
-    (aunque se pidiera refrescar) o None si no la hay, en vez de abortar.
-    """
-    os.makedirs(CACHE, exist_ok=True)
-    clave = hashlib.sha1(consulta.encode()).hexdigest()[:16]
-    ruta = os.path.join(CACHE, f"op_{etiqueta}_{clave}.json")
-
-    def leer_cache():
-        with open(ruta, encoding="utf-8") as f:
-            return json.load(f)
-
-    if os.path.exists(ruta) and not refrescar:
-        return leer_cache()
-    cuerpo = urllib.parse.urlencode({"data": consulta}).encode()
-    espera = 15
-    for intento in range(intentos):
-        servidor = SERVIDORES_OVERPASS[intento % len(SERVIDORES_OVERPASS)]
-        try:
-            datos = json.loads(descargar(servidor, cuerpo, timeout=360))
-            aviso = datos.get("remark", "")
-            if "error" in aviso.lower():
-                raise RuntimeError(aviso[:160])
-            with open(ruta, "w", encoding="utf-8") as f:
-                json.dump(datos, f)
-            time.sleep(2)  # cortesía con el servidor público
-            return datos
-        except Exception as e:  # noqa: BLE001 - cualquier fallo de red se reintenta
-            print(f"    {servidor.split('/')[2]} no respondió ({str(e)[:90]}); reintento en {espera}s", flush=True)
-            time.sleep(espera)
-            espera = min(espera * 2, 180)
-    if tolerante:
-        if os.path.exists(ruta):
-            print(f"    Sin respuesta para '{etiqueta}': se usa la copia anterior de la caché.", flush=True)
-            return leer_cache()
-        return None
-    raise SystemExit(f"No se pudo completar la consulta '{etiqueta}'. Vuelve a ejecutar más tarde (la caché conserva lo ya descargado).")
 
 
 # ----------------------------------------------------------------------------- DGT
@@ -238,6 +206,95 @@ def leer_dgt(ruta):
                     "relativo": r.get("relativo"), "sentido": r.get("sentido"),
                 })
     return radares, publicado
+
+
+# ----------------------------------------------------------------------------- Cataluña (SCT)
+
+
+def utm_a_latlon(x, y, huso=31):
+    """ETRS89 / UTM huso norte a (latitud, longitud). Serie clásica de Snyder, precisión < 1 m."""
+    a, f, k0 = 6378137.0, 1 / 298.257222101, 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+    x -= 500000.0
+    mu = (y / k0) / (a * (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256))
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    fi1 = (mu + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * math.sin(2 * mu) + (21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32) * math.sin(4 * mu)
+           + (151 * e1 ** 3 / 96) * math.sin(6 * mu) + (1097 * e1 ** 4 / 512) * math.sin(8 * mu))
+    s, c, t = math.sin(fi1), math.cos(fi1), math.tan(fi1)
+    n1 = a / math.sqrt(1 - e2 * s * s)
+    t1, c1 = t * t, ep2 * c * c
+    r1 = a * (1 - e2) / (1 - e2 * s * s) ** 1.5
+    d = x / (n1 * k0)
+    lat = fi1 - (n1 * t / r1) * (d ** 2 / 2 - (5 + 3 * t1 + 10 * c1 - 4 * c1 ** 2 - 9 * ep2) * d ** 4 / 24
+                                 + (61 + 90 * t1 + 298 * c1 + 45 * t1 ** 2 - 252 * ep2 - 3 * c1 ** 2) * d ** 6 / 720)
+    lon = math.radians((huso - 1) * 6 - 180 + 3) + (d - (1 + 2 * t1 + c1) * d ** 3 / 6
+                                                    + (5 - 2 * c1 + 28 * t1 - 3 * c1 ** 2 + 8 * ep2 + 24 * t1 ** 2) * d ** 5 / 120) / c
+    return math.degrees(lat), math.degrees(lon)
+
+
+def _coordenada_utm(texto, minimo, maximo):
+    """El fichero oficial trae coordenadas sin separador decimal ("42552972" = 425529,72): se reescalan."""
+    valor = float(texto.replace(",", "."))
+    for _ in range(6):
+        if minimo <= valor <= maximo:
+            return valor
+        valor /= 10
+    return None
+
+
+def leer_sct(ruta):
+    """
+    Radares fijos del Servei Català de Trànsit: «Via PK Velocitat X Y» (UTM 31N, ETRS89).
+
+    En los radares de tramo el PK viene como «inicio-fin» (p. ej. «501,5-506,5»): el orden
+    de los kilómetros indica el sentido vigilado.
+    """
+    radares = []
+    patron = re.compile(r"^(.*?)\s+(\d+(?:,\d+)?)\s*(?:-\s*(\d+(?:,\d+)?))?$")
+    with open(ruta, encoding="latin-1") as f:
+        for linea in f:
+            partes = linea.split()
+            if len(partes) < 5:
+                continue
+            try:
+                limite = int(float(partes[-3].replace(",", ".")))
+                x = _coordenada_utm(partes[-2], 250000, 530000)
+                y = _coordenada_utm(partes[-1], 4480000, 4760000)
+            except ValueError:
+                continue  # cabecera
+            m = patron.match(" ".join(partes[:-3]))
+            if m is None or x is None or y is None:
+                continue
+            via = m.group(1)
+            pk = float(m.group(2).replace(",", "."))
+            pk_fin = float(m.group(3).replace(",", ".")) if m.group(3) else None
+            relativo = None if pk_fin is None or pk_fin == pk else ("positive" if pk_fin > pk else "negative")
+            lat, lon = utm_a_latlon(x, y)
+            radares.append({"id": f"SCT-{via}-{pk:g}", "tipo": "F", "fuente": "SCT", "punto": (lat, lon),
+                            "carretera": via.split()[0], "pk": pk, "relativo": relativo, "sentido": None,
+                            "limite_oficial": limite})
+    # La misma vía y PK puede salir dos veces (un radar por sentido): ids únicos
+    vistos = Counter()
+    for r in radares:
+        vistos[r["id"]] += 1
+        if vistos[r["id"]] > 1:
+            r["id"] += f"-{vistos[r['id']]}"
+    return radares
+
+
+def descargar_con_copia(url, ruta, comprobar, nombre):
+    """Descarga una lista oficial; si el servidor falla, usa la última copia buena."""
+    try:
+        datos = descargar(url)
+        if not comprobar(datos):
+            raise RuntimeError("contenido inesperado")
+        with open(ruta, "wb") as f:
+            f.write(datos)
+    except Exception as e:  # noqa: BLE001
+        if not os.path.exists(ruta):
+            raise SystemExit(f"No se pudo descargar la lista de {nombre}: {e}")
+        print(f"  {nombre} no respondió ({str(e)[:80]}); se usa la copia anterior.", flush=True)
 
 
 # ----------------------------------------------------------------------------- OSM: utilidades
@@ -364,57 +421,60 @@ def arista_mas_cercana(p, lista, coords, rumbo_deseado=None, tolerancia=60, max_
     return mejor
 
 
-def caminos_aproximacion(p, arista, entrantes, coords):
-    """Recorre la carretera hacia atrás desde el radar: caminos por los que se llega a él."""
-    _, t, u, v, _ = arista
+def caminos_aproximacion(p, arista, entrantes, coords, clave):
+    """
+    Caminos por los que se llega al radar, recorriendo la red hacia atrás desde él.
+
+    Primero la carretera principal: en cada cruce se sigue la continuación más natural
+    (la misma carretera y el menor giro), atravesando rotondas y enlaces. Después, por orden
+    de cercanía al radar, los accesos laterales de esos cruces (otra calle o un ramal de
+    entrada que desemboca antes del radar), cada uno con su propia continuación.
+    """
+    _, t, u, v, _via = arista
     inicio = interpolar(coords[u], coords[v], t)
-    caminos = []
 
-    def explorar(nodo, siguiente, recorrido, puntos, visitados):
-        if len(caminos) >= MAX_RAMAS:
-            return
-        if recorrido >= LONG_APROXIMACION:
-            caminos.append(puntos)
-            return
-        opciones = [(w, via) for (w, via) in entrantes.get(nodo, []) if w != siguiente and w not in visitados]
-        if not opciones:
-            caminos.append(puntos)
-            return
-        for w, _via in opciones[:3]:
-            explorar(w, nodo, recorrido + distancia(coords[w], coords[nodo]), puntos + [coords[w]], visitados | {w})
+    def seguir(nodo, siguiente, recorrido, puntos, nodos, visitados):
+        cruces = []
+        while recorrido < LONG_APROXIMACION:
+            opciones = [(w, via) for (w, via) in entrantes.get(nodo, []) if w != siguiente and w not in visitados]
+            if not opciones:
+                break
+            salida = rumbo(coords[nodo], coords[siguiente])
 
-    explorar(u, v, distancia(coords[u], inicio), [inicio, coords[u]], {u, v})
+            def coste(op):
+                w, via = op
+                giro = dif_angulo(rumbo(coords[w], coords[nodo]), salida)
+                return (giro > 120, 0 if misma_carretera(via.get("tags", {}), clave) else 1, giro)
+
+            opciones.sort(key=coste)
+            cruces.append((len(puntos), recorrido, nodo, opciones[1:]))
+            w = opciones[0][0]
+            recorrido += distancia(coords[w], coords[nodo])
+            puntos.append(coords[w])
+            nodos.append(w)
+            visitados.add(w)
+            siguiente, nodo = nodo, w
+        return puntos, nodos, recorrido, cruces
+
+    principal, nodos, _, cruces = seguir(u, v, distancia(coords[u], inicio), [inicio, coords[u]], [None, u], {u, v})
+    caminos = [principal]
+    for idx, recorrido, nodo, alternativas in cruces:
+        if len(caminos) >= MAX_RAMAS or recorrido > LONG_APROXIMACION - MIN_RAMA:
+            break
+        for w, _via in alternativas:
+            if len(caminos) >= MAX_RAMAS:
+                break
+            hasta = recorrido + distancia(coords[w], coords[nodo])
+            puntos, _, total, _ = seguir(w, nodo, hasta, principal[:idx] + [coords[w]], nodos[:idx] + [w],
+                                         set(nodos[1:idx]) | {v, w})
+            if total - recorrido >= MIN_RAMA:
+                caminos.append(puntos)
     resultado = []
     for camino in caminos:
         camino = list(reversed(camino))  # de lejos hacia el radar
-        if sum(distancia(a, b) for a, b in zip(camino, camino[1:])) >= 150:
+        if sum(distancia(a, b) for a, b in zip(camino, camino[1:])) >= MIN_APROXIMACION:
             resultado.append(codificar_polilinea(simplificar(camino)))
     return resultado
-
-
-def cargar_cache(red, prefijo):
-    """Añade a la red todas las carreteras descargadas en ejecuciones anteriores."""
-    for ruta in sorted(glob.glob(os.path.join(CACHE, f"op_{prefijo}_*.json"))):
-        with open(ruta, encoding="utf-8") as f:
-            red.anadir(json.load(f).get("elements", []))
-
-
-RUTA_COBERTURA = os.path.join(CACHE, "cobertura.json")
-
-
-def leer_cobertura(refrescar):
-    """Radares cuya carretera ya se consultó (aunque la consulta no devolviera nada)."""
-    if refrescar or not os.path.exists(RUTA_COBERTURA):
-        return {"vias": set(), "trazado": set()}
-    with open(RUTA_COBERTURA, encoding="utf-8") as f:
-        datos = json.load(f)
-    return {k: set(datos.get(k, [])) for k in ("vias", "trazado")}
-
-
-def guardar_cobertura(cobertura, etapa, lote):
-    cobertura[etapa].update(r["id"] for r in lote)
-    with open(RUTA_COBERTURA, "w", encoding="utf-8") as f:
-        json.dump({k: sorted(v) for k, v in cobertura.items()}, f)
 
 
 # ----------------------------------------------------------------------------- hitos kilométricos
@@ -464,7 +524,7 @@ def rumbo_dgt_aproximado(r, hitos):
 def rumbo_osm(c, via_de_nodo, coords):
     """Sentido que vigila un radar de OSM (etiqueta direction o calzada de sentido único)."""
     d = (c.get("tags", {}).get("direction") or "").strip().upper()
-    if d.replace(".", "").isdigit():
+    if d.replace(".", "").isdigit() and d != "1":
         return float(d) % 360
     if d in CARDINALES:
         return CARDINALES[d]
@@ -498,77 +558,186 @@ def comprobar_tramos(radares, hitos):
     print(f"Control de tramos (inicio DGT coincide con el PK de los hitos): {bien} bien, {mal} dudosos")
 
 
+# ----------------------------------------------------------------------------- OpenStreetMap (fichero .osm.pbf)
+
+
+def _etiquetas(objeto):
+    return {t.k: t.v for t in objeto.tags}
+
+
+def leer_pbf_nodos(ruta):
+    """Radares (highway=speed_camera) e hitos kilométricos (highway=milestone)."""
+    import osmium
+    camaras, hitos = [], []
+    filtro = osmium.filter.TagFilter(("highway", "speed_camera"), ("highway", "milestone"))
+    for n in osmium.FileProcessor(ruta, osmium.osm.NODE).with_filter(filtro):
+        if not n.location.valid():
+            continue
+        e = {"type": "node", "id": n.id, "lat": n.location.lat, "lon": n.location.lon, "tags": _etiquetas(n)}
+        (camaras if e["tags"].get("highway") == "speed_camera" else hitos).append(e)
+    return camaras, hitos
+
+
+def leer_pbf_vias(ruta, centros, radio):
+    """Carreteras de coche con algún punto a menos de ~radio metros de alguno de los centros."""
+    import osmium
+    patron = re.compile(VIAS)
+    celda = 0.01
+    zona = set()
+    for lat, lon in centros:
+        n_lat = int(radio / 111000 / celda) + 1
+        n_lon = int(radio / (111000 * max(0.2, math.cos(math.radians(lat)))) / celda) + 1
+        ci, cj = math.floor(lat / celda), math.floor(lon / celda)
+        for i in range(ci - n_lat, ci + n_lat + 1):
+            for j in range(cj - n_lon, cj + n_lon + 1):
+                zona.add((i, j))
+    vias = []
+    procesador = (osmium.FileProcessor(ruta, osmium.osm.NODE | osmium.osm.WAY)
+                  .with_locations()
+                  .with_filter(osmium.filter.EntityFilter(osmium.osm.WAY))
+                  .with_filter(osmium.filter.KeyFilter("highway")))
+    for w in procesador:
+        if not patron.match(w.tags.get("highway", "")) or w.tags.get("area") == "yes":
+            continue
+        if w.tags.get("access") in ("no", "private") or w.tags.get("motor_vehicle") in ("no", "private"):
+            continue
+        if not all(nd.location.valid() for nd in w.nodes):
+            continue  # vía cortada por el borde del fichero
+        puntos = [(nd.location.lat, nd.location.lon) for nd in w.nodes]
+        if not any((math.floor(la / celda), math.floor(lo / celda)) in zona for la, lo in puntos):
+            continue
+        vias.append({"type": "way", "id": w.id, "nodes": [nd.ref for nd in w.nodes], "tags": _etiquetas(w),
+                     "geometry": [{"lat": la, "lon": lo} for la, lo in puntos]})
+    return vias
+
+
+# Radares del mapa que no son radares fijos de velocidad (o ya no existen).
+PALABRAS_DESCARTE = [
+    ("móvil o remolque", r"m[oó]vil|remolc|remolque|itinerante"),
+    ("pedagógico", r"pedag[oòó]gic|no multa|informativ"),
+    ("semáforo en rojo", r"sem[aàá]for|paso en rojo|pas en vermell|en rojo"),
+    ("cinturón", r"cintur"),
+    ("retirado o erróneo", r"no es un radar|no existe|ya no hay|retirad|desmontad|eliminad|obviously wrong|position is wrong"),
+]
+
+
+def motivo_descarte(tags):
+    if tags.get("temporary") == "yes":
+        return "móvil o remolque"
+    if tags.get("enforcement") == "traffic_signals":
+        return "semáforo en rojo"
+    if any(k.split(":")[0] in ("disused", "removed", "abandoned", "demolished", "was") for k in tags):
+        return "retirado o erróneo"
+    texto = " ".join(v for k, v in tags.items() if k.split(":")[0] in ("note", "description", "fixme", "name") or k.startswith("note"))
+    for motivo, patron in PALABRAS_DESCARTE:
+        if re.search(patron, texto, re.IGNORECASE):
+            return motivo
+    return None
+
+
+def lado_de_la_calzada(p, arista, coords):
+    """Sentido de la arista en el que el punto queda a la derecha (o None si está sobre la vía)."""
+    d, _, u, v, _ = arista
+    if d < 2.5:
+        return None
+    a, b = coords[u], coords[v]
+    ax, ay = a_metros(a, b)
+    px, py = a_metros(a, p)
+    izquierda = ax * py - ay * px > 0
+    rb = rumbo(a, b)
+    return (rb + 180) % 360 if izquierda else rb
+
+
+def unico_sentido_cercano(p, lista, coords, cercana):
+    """Si todas las calzadas junto al radar van en el mismo sentido (calzada de sentido único), ese rumbo."""
+    rb = rumbo(coords[cercana[2]], coords[cercana[3]])
+    junto = [a for a in lista if proyeccion(p, coords[a[0]], coords[a[1]])[0] <= cercana[0] + 12]
+    if all(dif_angulo(rumbo(coords[u], coords[v]), rb) <= 60 for u, v, _ in junto):
+        return rb
+    return None
+
+
 # ----------------------------------------------------------------------------- proceso principal
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     argp = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    argp.add_argument("--refrescar", action="store_true", help="ignora la caché y lo descarga todo de nuevo")
-    argp.add_argument("--contar", action="store_true", help="solo dice cuántos radares faltan por descargar")
-    argp.add_argument("--sin-trazado", action="store_true",
-                      help="versión rápida: sin descargar carreteras (la app usa la regla de respaldo: radar delante y en tu sentido)")
-    argp.add_argument("--actualizar", action="store_true",
-                      help="actualización periódica: vuelve a bajar la lista de radares (DGT y OSM) pero reutiliza "
-                           "las carreteras ya descargadas; si un servidor falla, sigue con lo que haya")
-    argp.add_argument("--minutos", type=float, default=None,
-                      help="tiempo máximo descargando carreteras; lo que falte se pide en la siguiente ejecución")
+    argp.add_argument("--pbf", required=True, help="fichero .osm.pbf de OpenStreetMap (Geofabrik)")
     argp.add_argument("--salida", default=SALIDA, help="dónde escribir radares.json")
+    argp.add_argument("--zona", help="solo los radares dentro de lat1,lon1,lat2,lon2 (para pruebas con un fichero regional)")
+    argp.add_argument("--sin-descargas", action="store_true", help="usa las copias guardadas de la DGT y del SCT")
     args = argp.parse_args()
     os.makedirs(CACHE, exist_ok=True)
     inicio = time.monotonic()
-    # En una actualización se renuevan la lista de radares y los hitos, nunca las carreteras.
-    renovar_listas = args.refrescar or args.actualizar
 
-    # 1. DGT
+    def reloj():
+        return f"[{(time.monotonic() - inicio) / 60:.1f} min]"
+
+    # 1. Listas oficiales
     ruta_dgt = os.path.join(CACHE, "dgt_radares.xml")
-    if renovar_listas or not os.path.exists(ruta_dgt):
-        print("Descargando radares de la DGT…", flush=True)
-        try:
-            datos = descargar(URL_DGT)
-            if b"predefinedLocation" not in datos:
-                raise RuntimeError("la DGT no devolvió el fichero de radares esperado")
-            with open(ruta_dgt, "wb") as f:
-                f.write(datos)
-        except Exception as e:  # noqa: BLE001
-            if not (args.actualizar and os.path.exists(ruta_dgt)):
-                raise SystemExit(f"No se pudo descargar la lista de la DGT: {e}")
-            print(f"  La DGT no respondió ({str(e)[:90]}); se usa la copia anterior.", flush=True)
+    ruta_sct = os.path.join(CACHE, "sct_radares.txt")
+    if not args.sin_descargas:
+        print("Descargando radares de la DGT y del Servei Català de Trànsit…", flush=True)
+        descargar_con_copia(URL_DGT, ruta_dgt, lambda d: b"predefinedLocation" in d, "la DGT")
+        descargar_con_copia(URL_SCT, ruta_sct, lambda d: d.count(b"\n") > 50, "el SCT")
     radares, publicado_dgt = leer_dgt(ruta_dgt)
-    print(f"DGT: {sum(r['tipo'] == 'F' for r in radares)} fijos, {sum(r['tipo'] == 'T' for r in radares)} tramos (publicado {publicado_dgt})")
+    sct = leer_sct(ruta_sct)
+    print(f"DGT: {sum(r['tipo'] == 'F' for r in radares)} fijos, {sum(r['tipo'] == 'T' for r in radares)} tramos "
+          f"(publicado {publicado_dgt}) · SCT: {len(sct)} fijos")
+    radares += sct
 
-    # 2. OSM: radares, vías que los contienen e hitos kilométricos
-    area = 'area["ISO3166-1"="ES"][admin_level=2]->.es;'
-    print("Descargando radares de OpenStreetMap…", flush=True)
-    osm = overpass(f"[out:json][timeout:300];{area}node[highway=speed_camera](area.es)->.c;.c out body;way(bn.c)[highway]->.w;.w out body geom;",
-                   "camaras", renovar_listas, tolerante=args.actualizar)
-    print("Descargando hitos kilométricos de OpenStreetMap…", flush=True)
-    datos_hitos = overpass(f"[out:json][timeout:300];{area}node[highway=milestone](area.es);out body;",
-                           "hitos", renovar_listas, tolerante=args.actualizar)
-    if osm is None or datos_hitos is None:
-        raise SystemExit("OpenStreetMap no respondió y no hay copia anterior de los radares o de los hitos.")
-    hitos = indice_hitos(datos_hitos["elements"])
-    camaras = [e for e in osm["elements"] if e["type"] == "node"]
-    red = Red()
-    red.anadir(osm["elements"])
-    via_de_nodo = {}
-    for via in red.vias.values():
-        for n in via["nodes"]:
-            via_de_nodo.setdefault(n, via)
-    # Los propios radares DGT son "hitos": coordenadas con su punto kilométrico oficial.
+    # 2. OSM: radares e hitos
+    print(f"{reloj()} Leyendo radares e hitos del mapa…", flush=True)
+    camaras, nodos_hito = leer_pbf_nodos(args.pbf)
+    descartes = Counter()
+    validas = []
+    for c in camaras:
+        motivo = motivo_descarte(c["tags"])
+        if motivo:
+            descartes[motivo] += 1
+        else:
+            validas.append(c)
+    camaras = validas
+    print(f"OSM: {len(camaras)} radares válidos; descartados {sum(descartes.values())}: {dict(descartes)}")
+
+    if args.zona:
+        la1, lo1, la2, lo2 = (float(x) for x in args.zona.split(","))
+
+        def dentro(q):
+            return min(la1, la2) <= q[0] <= max(la1, la2) and min(lo1, lo2) <= q[1] <= max(lo1, lo2)
+
+        radares = [r for r in radares if dentro(r["punto"])]
+        camaras = [c for c in camaras if dentro((c["lat"], c["lon"]))]
+
+    hitos = indice_hitos(nodos_hito)
+    # Los propios radares oficiales son "hitos": coordenadas con su punto kilométrico oficial.
     for r in radares:
         if r.get("carretera") and r.get("pk") is not None:
             hitos[normalizar_ref(r["carretera"])].append((r["punto"], r["pk"]))
             if r["tipo"] == "T" and r.get("pk_fin") is not None:
                 hitos[normalizar_ref(r["carretera"])].append((r["fin"], r["pk_fin"]))
-    print(f"OSM: {len(camaras)} radares, hitos en {len(hitos)} carreteras")
-    comprobar_tramos(radares, hitos)
+    comprobar_tramos([r for r in radares if r["fuente"] == "DGT"], hitos)
 
-    # 3. Emparejar radares DGT con OSM (mismo lugar y sentido compatible) y añadir los que solo están en OSM
+    # 3. Carreteras alrededor de todos los radares
+    print(f"{reloj()} Leyendo las carreteras alrededor de los radares…", flush=True)
+    centros = [r["punto"] for r in radares] + [r["fin"] for r in radares if r.get("fin")] + [(c["lat"], c["lon"]) for c in camaras]
+    red = Red()
+    red.anadir(leer_pbf_vias(args.pbf, centros, RADIO_RED))
+    print(f"{reloj()} {len(red.vias)} tramos de carretera cargados")
+    ids_camara = {c["id"] for c in camaras}
+    via_de_nodo = {}
+    for via in red.vias.values():
+        for n in via["nodes"]:
+            if n in ids_camara:
+                via_de_nodo.setdefault(n, via)
+
+    # 4. Emparejar radares oficiales con OSM (mismo lugar y sentido compatible); el resto de OSM, «posibles»
     rumbo_camara = {c["id"]: rumbo_osm(c, via_de_nodo, red.coords) for c in camaras}
     usadas = set()
     for r in radares:
-        r["rumbo_aprox"] = rumbo_dgt_aproximado(r, hitos)
+        r["oficial"] = True
+        r["rumbo_aprox"] = rumbo_dgt_aproximado(r, hitos)  # DGT y tramos del SCT: PK oficial + hitos
 
         def compatible(c):
             rc = rumbo_camara[c["id"]]
@@ -589,172 +758,98 @@ def main():
     for c in camaras:
         if c["id"] in usadas:
             continue
-        tags = c.get("tags", {})
         radares.append({"id": f"OSM-{c['id']}", "tipo": "F", "fuente": "OSM", "punto": (c["lat"], c["lon"]),
                         "carretera": None, "pk": None, "relativo": None, "sentido": None, "osm": c,
-                        "limite_osm": numero(tags.get("maxspeed"))})
+                        "oficial": False, "rumbo_aprox": None})
     for r in radares:
-        if "osm" in r and r["osm"].get("tags", {}).get("maxspeed"):
-            r["limite_osm"] = numero(r["osm"]["tags"]["maxspeed"])
-    print(f"Total: {len(radares)} radares ({sum(r['fuente'] == 'OSM' for r in radares)} solo en OSM)")
+        r["limite"] = r.get("limite_oficial") or (numero(r["osm"]["tags"].get("maxspeed")) if "osm" in r else None)
+    print(f"Total: {len(radares)} radares ({sum(r['oficial'] for r in radares)} oficiales, "
+          f"{sum(not r['oficial'] for r in radares)} posibles, solo en OSM)")
 
-    # 4. Identificar la carretera de cada radar (ref o nombre)
-    sin_via = [r for r in radares if not r.get("carretera") and not ("osm" in r and r["osm"]["id"] in via_de_nodo)]
-    if args.sin_trazado:
-        sin_via = []
-    # Se reaprovecha todo lo descargado antes y solo se pide lo que falta.
-    cobertura = leer_cobertura(args.refrescar)
-    if not args.refrescar:
-        cargar_cache(red, "vias_cercanas")
-
-    def tiene_via_cerca(r):
-        _, lista = aristas_dirigidas(red.vias_cerca(r["punto"], 100))
-        return arista_mas_cercana(r["punto"], lista, red.coords) is not None
-
-    def queda_tiempo():
-        return args.minutos is None or (time.monotonic() - inicio) / 60 < args.minutos
-
-    sin_via = [r for r in sin_via if r["id"] not in cobertura["vias"] and not tiene_via_cerca(r)]
-    print(f"Buscando la carretera de {len(sin_via)} radares sin vía conocida…", flush=True)
-    for i in range(0, 0 if args.contar else len(sin_via), 100):
-        lote = sin_via[i:i + 100]
-        sentencias = "".join(f'way(around:{MAX_DIST_RADAR_VIA},{r["punto"][0]:.6f},{r["punto"][1]:.6f})[highway~"{VIAS}"];' for r in lote)
-        # El nombre lleva una huella de los radares del lote: así un lote nuevo nunca pisa uno anterior.
-        huella = hashlib.sha1("".join(r["id"] for r in lote).encode()).hexdigest()[:8]
-        respuesta = overpass(f"[out:json][timeout:240];({sentencias});out body geom;", f"vias_cercanas_{huella}",
-                             args.refrescar, tolerante=args.actualizar, intentos=6 if args.actualizar else 12)
-        if respuesta is None:
-            print("  Overpass no responde: los radares que faltan se buscarán en la próxima actualización.", flush=True)
-            break
-        red.anadir(respuesta["elements"])
-        guardar_cobertura(cobertura, "vias", lote)
-        print(f"  {min(i + 100, len(sin_via))}/{len(sin_via)}", flush=True)
-    for r in radares:
-        if r.get("carretera"):
-            r["clave"] = ("ref", frozenset({normalizar_ref(r["carretera"])}))
-            continue
-        via = via_de_nodo.get(r["osm"]["id"]) if "osm" in r else None
-        if via is None:
-            _, lista = aristas_dirigidas([v for v in red.vias_cerca(r["punto"], 100) if clave_carretera(v.get("tags", {}))])
-            cercana = arista_mas_cercana(r["punto"], lista, red.coords)
-            via = cercana[4] if cercana else None
-        r["clave"] = clave_carretera(via.get("tags", {})) if via else None
-        if via is not None:
-            r["carretera"] = (via["tags"].get("ref") or "").split(";")[0] or via["tags"].get("name")
-
-    # 5. Descargar el trazado de cada carretera alrededor de su radar
-    con_clave = [] if args.sin_trazado else [r for r in radares if r.get("clave")]
-    if not args.refrescar:
-        cargar_cache(red, "trazado")
-
-    def trazado_cubierto(r):
-        """¿Ya hay carretera descargada junto al radar y hasta ~1 km antes y después?"""
-        cerca = lejos = False
-        for v in red.vias_cerca(r["punto"], RADIO_CARRETERA):
-            if not misma_carretera(v.get("tags", {}), r["clave"]):
-                continue
-            for g in v["geometry"]:
-                d = distancia(r["punto"], (g["lat"], g["lon"]))
-                cerca = cerca or d < 100
-                lejos = lejos or 900 < d < RADIO_CARRETERA
-            if cerca and lejos:
-                return True
-        return False
-
-    con_clave = [r for r in con_clave if r["id"] not in cobertura["trazado"] and not trazado_cubierto(r)]
-    print(f"Descargando el trazado de la carretera de {len(con_clave)} radares…", flush=True)
-    if args.contar:
-        return
-    # Por zonas (celdas de ~10 km): los radares de un lote quedan juntos y cada consulta
-    # cubre también a sus vecinos, que entonces ya no hace falta pedir.
-    pendientes = sorted(con_clave, key=lambda r: (round(r["punto"][0], 1), round(r["punto"][1], 1), r["punto"]))
-    total, hechos, consulta = len(pendientes), 0, 0
-    lote_n = 25
-    while pendientes:
-        if not queda_tiempo():
-            print(f"  Tiempo agotado: {len(pendientes)} radares quedan para la próxima actualización.", flush=True)
-            break
-        lote = []
-        while pendientes and len(lote) < lote_n:
-            r = pendientes.pop(0)
-            hechos += 1
-            if consulta == 0 or not trazado_cubierto(r):
-                lote.append(r)
-        if not lote:
-            break
-        sentencias = []
-        for r in lote:
-            tipo, valor = r["clave"]
-            lat, lon = r["punto"]
-            if tipo == "ref":
-                # OSM escribe "A-2" o "A-2;E-90": el patrón admite el guion opcional y listas con ';'
-                alternativas = "|".join("-?".join(_partes(v)) for v in sorted(valor))
-                filtro = f'[ref~"(^|;) *({alternativas}) *(;|$)"]'
-            else:
-                filtro = '[name="' + valor.replace('"', '\\"') + '"]'
-            sentencias.append(f'way(around:{RADIO_CARRETERA},{lat:.6f},{lon:.6f})[highway~"{VIAS}"]{filtro};')
-        respuesta = overpass(f"[out:json][timeout:300];({''.join(sentencias)});out body geom;", f"trazado_z{consulta}",
-                             args.refrescar, tolerante=args.actualizar, intentos=6 if args.actualizar else 12)
-        if respuesta is None:
-            print(f"  Overpass no responde: {total - hechos + len(lote)} radares se completarán en la próxima actualización "
-                  "(mientras, la app usa con ellos la regla de respaldo).", flush=True)
-            break
-        red.anadir(respuesta["elements"])
-        guardar_cobertura(cobertura, "trazado", lote)
-        consulta += 1
-        print(f"  {hechos}/{total} radares revisados ({consulta} consultas)", flush=True)
-
-    # 6. Sentido vigilado, límite y caminos de aproximación
+    # 5. Carretera, sentido, límite y caminos de aproximación de cada radar
+    print(f"{reloj()} Calculando sentidos y aproximaciones…", flush=True)
     metodos = Counter()
     salida = []
     for r in radares:
         p = r["punto"]
-        vias = [v for v in red.vias_cerca(p, RADIO_CARRETERA) if misma_carretera(v.get("tags", {}), r.get("clave"))]
-        entrantes, lista = aristas_dirigidas(vias)
-        # Sentido vigilado. Orden de preferencia:
-        #   a) DGT: punto kilométrico creciente/decreciente orientado con los hitos de OSM
-        #      (en un tramo, del inicio hacia el final)
-        #   b) OSM: etiqueta direction o radar dibujado sobre una calzada de sentido único
-        rumbo_vigilado, metodo = r.get("rumbo_aprox"), ("dgt_pk" if r.get("rumbo_aprox") is not None else "desconocido")
-        if rumbo_vigilado is None and r.get("osm") is not None:
-            rumbo_vigilado = rumbo_camara[r["osm"]["id"]]
-            metodo = "osm" if rumbo_vigilado is not None else metodo
-        if rumbo_vigilado is not None:  # alinear con la carretera real junto al radar
-            cercana = arista_mas_cercana(p, lista, red.coords, max_dist=80)
-            if cercana:
+        entrantes, lista = aristas_dirigidas(red.vias_cerca(p, RADIO_RED))
+        via_osm = via_de_nodo.get(r["osm"]["id"]) if "osm" in r else None
+        if r.get("carretera"):
+            clave = ("ref", frozenset({normalizar_ref(r["carretera"])}))
+        elif via_osm is not None:
+            clave = clave_carretera(via_osm.get("tags", {}))
+        else:
+            cercana = arista_mas_cercana(p, [a for a in lista if clave_carretera(a[2].get("tags", {}))], red.coords)
+            clave = clave_carretera(cercana[4].get("tags", {})) if cercana else None
+        propia = [a for a in lista if misma_carretera(a[2].get("tags", {}), clave)] if clave else lista
+        max_dist = MAX_DIST_OFICIAL if r["oficial"] else MAX_DIST_RADAR_VIA
+        if not arista_mas_cercana(p, propia, red.coords, max_dist=max_dist):
+            propia = lista  # la carretera indicada no está a mano: cualquier vía junto al radar
+        cercana = arista_mas_cercana(p, propia, red.coords, max_dist=max_dist)
+        if r.get("carretera") is None and cercana is not None:
+            tags = cercana[4].get("tags", {})
+            r["carretera"] = (tags.get("ref") or "").split(";")[0] or tags.get("name")
+
+        # Sentido vigilado: uno seguro (o el más probable) y, si hay dudas, el otro como «dudoso»
+        rumbo_osm_c = rumbo_camara.get(r["osm"]["id"]) if "osm" in r else None
+        seguro, dudosos, metodo = None, [], "desconocido"
+        if r["tipo"] == "T":
+            seguro, metodo = rumbo(r["punto"], r["fin"]), "tramo"
+        elif r["rumbo_aprox"] is not None:
+            seguro, metodo = r["rumbo_aprox"], "dgt_pk"
+            if rumbo_osm_c is not None and dif_angulo(rumbo_osm_c, seguro) > 90:
+                dudosos.append(rumbo_osm_c)  # el mapa dice otra cosa: se avisa también, como posible
+                metodo = "dgt_pk_con_dudas"
+        elif rumbo_osm_c is not None:
+            seguro, metodo = rumbo_osm_c, "osm"
+        elif cercana is not None:
+            unico = unico_sentido_cercano(p, propia, red.coords, cercana)
+            if unico is not None:
+                seguro, metodo = unico, "sentido_unico"
+            else:
                 rb = rumbo(red.coords[cercana[2]], red.coords[cercana[3]])
-                rumbo_vigilado = rb if dif_angulo(rb, rumbo_vigilado) <= 90 else (rb + 180) % 360
+                lado = lado_de_la_calzada(p, cercana, red.coords)
+                if lado is not None:
+                    seguro, metodo = lado, "lado_calzada"
+                    dudosos.append((lado + 180) % 360)
+                else:
+                    dudosos += [rb, (rb + 180) % 360]
+        if seguro is not None and cercana is not None:  # alinear con la carretera real junto al radar
+            alineada = arista_mas_cercana(p, propia, red.coords, rumbo_deseado=seguro, tolerancia=90, max_dist=max_dist)
+            if alineada:
+                seguro = rumbo(red.coords[alineada[2]], red.coords[alineada[3]])
         metodos[metodo] += 1
 
-        # caminos de aproximación (uno por sentido vigilado; si no se sabe, ambos)
-        aproximaciones, limite = [], r.get("limite_osm")
-        rumbos = [rumbo_vigilado] if rumbo_vigilado is not None else [None]
-        if rumbo_vigilado is None:
-            primera = arista_mas_cercana(p, lista, red.coords)
-            if primera:
-                rb = rumbo(red.coords[primera[2]], red.coords[primera[3]])
-                rumbos = [rb, (rb + 180) % 360]
-        for rb in rumbos:
-            if rb is None or args.sin_trazado:
-                continue
-            arista = arista_mas_cercana(p, lista, red.coords, rumbo_deseado=rb, tolerancia=60)
+        def aproximaciones(rb):
+            arista = arista_mas_cercana(p, propia, red.coords, rumbo_deseado=rb, tolerancia=60, max_dist=max_dist)
             if arista is None:
+                return [], None
+            tags = arista[4].get("tags", {})
+            adelante = arista[4]["nodes"].index(arista[2]) < arista[4]["nodes"].index(arista[3])
+            limite = numero(tags.get("maxspeed:forward" if adelante else "maxspeed:backward")) or numero(tags.get("maxspeed"))
+            return caminos_aproximacion(p, arista, entrantes, red.coords, clave), limite
+
+        ap, limite_via = aproximaciones(seguro) if seguro is not None else ([], None)
+        ap2 = []
+        for rb in dudosos:
+            if seguro is not None and dif_angulo(rb, seguro) < 60:
                 continue
-            aproximaciones += caminos_aproximacion(p, arista, entrantes, red.coords)
-            if limite is None:
-                tags = arista[4].get("tags", {})
-                adelante = tags.get("maxspeed:forward") if arista[4]["nodes"].index(arista[2]) < arista[4]["nodes"].index(arista[3]) else tags.get("maxspeed:backward")
-                limite = numero(adelante) or numero(tags.get("maxspeed"))
+            caminos, lim = aproximaciones(rb)
+            ap2 += caminos
+            limite_via = limite_via or lim
+        limite = r.get("limite") or limite_via
 
         item = {"id": r["id"], "t": r["tipo"], "la": round(p[0], 6), "lo": round(p[1], 6), "f": r["fuente"]}
+        if r["oficial"]:
+            item["o"] = 1
         if r.get("carretera"):
             item["c"] = r["carretera"]
         if r.get("pk") is not None:
             item["pk"] = round(r["pk"], 2)
         if r.get("sentido"):
             item["s"] = r["sentido"]
-        if rumbo_vigilado is not None:
-            item["r"] = round(rumbo_vigilado, 1)
+        if seguro is not None:
+            item["r"] = round(seguro, 1)
         if limite:
             item["lim"] = limite
         if r["tipo"] == "T":
@@ -763,18 +858,20 @@ def main():
                 item["len"] = int(abs(r["pk_fin"] - r["pk"]) * 1000)
             else:
                 item["len"] = int(distancia(p, r["fin"]))
-        if aproximaciones:
-            item["ap"] = aproximaciones
+        if ap:
+            item["ap"] = ap
+        if ap2:
+            item["ap2"] = ap2
         salida.append(item)
 
-    # 7. Guardar
+    # 6. Guardar
     ruta_salida = os.path.abspath(args.salida)
     os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
     resultado = {
         "version": 1,
         "generado": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "dgt_publicado": publicado_dgt,
-        "atribucion": "Radares: DGT (nap.dgt.es) y © colaboradores de OpenStreetMap (ODbL)",
+        "atribucion": "Radares: DGT (nap.dgt.es), Servei Català de Trànsit y © colaboradores de OpenStreetMap (ODbL)",
         "radares": salida,
     }
     temporal = ruta_salida + ".tmp"
@@ -782,20 +879,16 @@ def main():
         json.dump(resultado, f, ensure_ascii=False, separators=(",", ":"))
     shutil.move(temporal, ruta_salida)
 
-    con_ap = sum(1 for s in salida if "ap" in s)
-    print("\nResumen")
-    print(f"  Radares: {len(salida)}  (fijos {sum(s['t'] == 'F' for s in salida)}, tramos {sum(s['t'] == 'T' for s in salida)})")
+    con_ap = sum(1 for s in salida if "ap" in s or "ap2" in s)
+    print(f"\n{reloj()} Resumen")
+    print(f"  Radares: {len(salida)}  (fijos {sum(s['t'] == 'F' for s in salida)}, tramos {sum(s['t'] == 'T' for s in salida)}, "
+          f"oficiales {sum('o' in s for s in salida)})")
     print(f"  Con camino de aproximación: {con_ap} ({100 * con_ap // max(1, len(salida))} %)")
+    print(f"  Con sentido seguro o probable: {sum('ap' in s for s in salida)} · solo dudosos: "
+          f"{sum('ap2' in s and 'ap' not in s for s in salida)}")
     print(f"  Con límite de velocidad: {sum(1 for s in salida if 'lim' in s)}")
     print(f"  Origen del sentido vigilado: {dict(metodos)}")
     print(f"  Fichero: {ruta_salida} ({os.path.getsize(ruta_salida) // 1024} KB)")
-
-
-def _partes(ref_normalizada):
-    """'A2' -> ['A', '2'] para construir el patrón 'A-?2' (OSM usa 'A-2')."""
-    letras = "".join(ch for ch in ref_normalizada if not ch.isdigit()).rstrip()
-    resto = ref_normalizada[len(letras):]
-    return [letras, resto] if letras and resto else [ref_normalizada]
 
 
 if __name__ == "__main__":
